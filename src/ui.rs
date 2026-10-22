@@ -2,7 +2,7 @@
 //! affects the hotkeys, tray or watchdog in the core. It edits config.json and pings the core.
 
 use crate::capture::{self, WinInfo};
-use crate::config::{Binding, Config, Target, Theme};
+use crate::config::{Binding, ButtonStyle, Config, Target, Theme};
 use crate::core::WM_RELOAD;
 use crate::input::WM_SHOOT;
 use eframe::egui::{self, Color32, RichText, TextureHandle};
@@ -268,6 +268,12 @@ impl App {
             ui.heading("Screenshot button");
             changed |= ui.checkbox(&mut self.cfg.floating_button, "Floating button on screen (drag to move, right-click to hide)").changed();
             changed |= ui.checkbox(&mut self.cfg.picker_button, "Button inside this window").changed();
+            ui.horizontal(|ui| {
+                ui.label("Button style:");
+                for (s, n) in [(ButtonStyle::Dark, "Dark"), (ButtonStyle::Light, "White")] {
+                    changed |= ui.selectable_value(&mut self.cfg.button_style, s, n).changed();
+                }
+            });
             ui.add_space(10.0);
 
             ui.heading("Feedback");
@@ -281,6 +287,16 @@ impl App {
             ui.horizontal(|ui| {
                 ui.label("Folder:");
                 changed |= ui.text_edit_singleline(&mut self.cfg.save_folder).lost_focus();
+                if ui.button("Browse...").clicked() {
+                    if let Some(dir) = rfd::FileDialog::new().set_directory(&self.cfg.save_folder).pick_folder() {
+                        self.cfg.save_folder = dir.to_string_lossy().into_owned();
+                        changed = true;
+                    }
+                }
+                if ui.button("Open").clicked() {
+                    let _ = std::fs::create_dir_all(&self.cfg.save_folder);
+                    let _ = std::process::Command::new("explorer").arg(&self.cfg.save_folder).spawn();
+                }
             });
             ui.add_space(10.0);
 

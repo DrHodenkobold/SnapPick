@@ -10,6 +10,7 @@ image = { version = "0.25", default-features = false, features = ["png"] }
 arboard = "3"
 eframe = "0.29"
 winreg = "0.52"
+rfd = "0.15"
 
 [dependencies.windows]
 version = "0.58"

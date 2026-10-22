@@ -115,9 +115,16 @@ pub enum Theme {
     Light,
 }
 
+#[derive(Clone, Copy, Serialize, Deserialize, PartialEq, Debug)]
+pub enum ButtonStyle {
+    Dark,
+    Light,
+}
+
 #[derive(Clone, Serialize, Deserialize, PartialEq, Debug)]
 #[serde(default)]
 pub struct Config {
+    pub button_style: ButtonStyle,
     pub toggle_bind: Binding,
     pub shoot_bind: Binding,
     pub floating_button: bool,
@@ -138,6 +145,7 @@ pub struct Config {
 impl Default for Config {
     fn default() -> Self {
         Config {
+            button_style: ButtonStyle::Dark,
             toggle_bind: Binding::key(0x78), // F9
             shoot_bind: Binding::key(0x79),  // F10
             floating_button: true,

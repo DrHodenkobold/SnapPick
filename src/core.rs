@@ -4,11 +4,12 @@
 //! on the settings UI, which is a separate process.
 
 use crate::capture::{self, WinInfo};
-use crate::config::{log, Config};
+use crate::config::{log, ButtonStyle, Config};
 use crate::input::{self, WM_SHOOT, WM_TOGGLE};
 use crate::watchdog;
 use std::cell::RefCell;
 use std::panic::{catch_unwind, AssertUnwindSafe};
+use std::sync::atomic::{AtomicI32, AtomicIsize, Ordering};
 use std::sync::Mutex;
 use windows::core::{w, HSTRING, PCWSTR};
 use windows::Win32::Foundation::*;
@@ -18,7 +19,7 @@ use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Input::KeyboardAndMouse::{ReleaseCapture, SetCapture};
 use windows::Win32::System::SystemInformation::GetLocalTime;
 use windows::Win32::System::Threading::ExitProcess;
-use windows::Win32::UI::HiDpi::{SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2};
+use windows::Win32::UI::HiDpi::{GetDpiForSystem, SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2};
 use windows::Win32::UI::Shell::*;
 use windows::Win32::UI::WindowsAndMessaging::*;
 
@@ -35,7 +36,14 @@ const TIMER_HOUSEKEEPING: usize = 1;
 const TIMER_TOAST: usize = 3;
 const TIMER_FLASH: usize = 4;
 
-const BTN_SIZE: i32 = 56;
+/// Core window handle, readable from any thread (the capture thread posts feedback to it).
+static CORE_HWND: AtomicIsize = AtomicIsize::new(0);
+static BTN_PX: AtomicI32 = AtomicI32::new(36);
+
+/// Button diameter in physical pixels (36 dip, scaled for the system DPI).
+fn btn_size() -> i32 {
+    BTN_PX.load(Ordering::Relaxed)
+}
 
 struct Feedback {
     text: String,
@@ -72,6 +80,7 @@ pub fn run(restarted: bool, background: bool) {
     unsafe {
         let _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
         let hinst: HINSTANCE = GetModuleHandleW(None).unwrap_or_default().into();
+        BTN_PX.store(36 * GetDpiForSystem() as i32 / 96, Ordering::Relaxed);
 
         register(hinst, w!("SnapPickCoreWnd"), Some(core_proc), None);
         register(hinst, w!("SnapPickButton"), Some(button_proc), Some(CreateSolidBrush(COLORREF(0x00_30_30_30))));
@@ -87,9 +96,9 @@ pub fn run(restarted: bool, background: bool) {
         let tool = WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_NOACTIVATE;
         let button = CreateWindowExW(
             tool, w!("SnapPickButton"), w!("SnapPickButton"), WS_POPUP,
-            0, 0, BTN_SIZE, BTN_SIZE, None, None, hinst, None,
+            0, 0, btn_size(), btn_size(), None, None, hinst, None,
         ).expect("button window");
-        SetWindowRgn(button, CreateEllipticRgn(0, 0, BTN_SIZE + 1, BTN_SIZE + 1), true);
+        SetWindowRgn(button, CreateEllipticRgn(0, 0, btn_size() + 1, btn_size() + 1), true);
         let toast = CreateWindowExW(
             tool, w!("SnapPickToast"), w!("SnapPickToast"), WS_POPUP,
             0, 0, 340, 56, None, None, hinst, None,
@@ -101,6 +110,7 @@ pub fn run(restarted: bool, background: bool) {
         ).expect("flash window");
         let _ = SetLayeredWindowAttributes(flash, COLORREF(0), 110, LWA_ALPHA);
 
+        CORE_HWND.store(core.0 as isize, Ordering::Relaxed);
         let cfg = Config::load();
         with(|s| {
             s.core = core;
@@ -164,6 +174,9 @@ fn apply_config() {
     watchdog::sync(&cfg);
     if !cfg.floating_button {
         hide_button();
+    }
+    unsafe {
+        let _ = InvalidateRect(with(|s| s.button), None, true); // pick up a changed button style
     }
 }
 
@@ -371,10 +384,10 @@ fn toggle_button() {
             let (x, y) = with(|s| s.button_pos).unwrap_or_else(|| {
                 let mut wa = RECT::default();
                 let _ = SystemParametersInfoW(SPI_GETWORKAREA, 0, Some(&mut wa as *mut _ as *mut _), SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS(0));
-                (wa.right - BTN_SIZE - 40, wa.top + 120)
+                (wa.right - btn_size() - 40, wa.top + 120)
             });
             with(|s| s.button_pos = Some((x, y)));
-            let _ = SetWindowPos(button, HWND_TOPMOST, x, y, BTN_SIZE, BTN_SIZE, SWP_NOACTIVATE | SWP_SHOWWINDOW);
+            let _ = SetWindowPos(button, HWND_TOPMOST, x, y, btn_size(), btn_size(), SWP_NOACTIVATE | SWP_SHOWWINDOW);
         }
     }
 }
@@ -399,16 +412,36 @@ unsafe fn button_proc_inner(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRE
         WM_PAINT => {
             let mut ps = PAINTSTRUCT::default();
             let dc = BeginPaint(hwnd, &mut ps);
-            let (red, white) = (CreateSolidBrush(COLORREF(0x00_4D_48_E5)), CreateSolidBrush(COLORREF(0x00_FF_FF_FF)));
-            let old = SelectObject(dc, white);
-            let pen = SelectObject(dc, GetStockObject(NULL_PEN));
-            let _ = Ellipse(dc, 4, 4, BTN_SIZE - 4, BTN_SIZE - 4);
-            SelectObject(dc, red);
-            let _ = Ellipse(dc, 11, 11, BTN_SIZE - 11, BTN_SIZE - 11);
-            SelectObject(dc, old);
-            SelectObject(dc, pen);
-            let _ = DeleteObject(red);
-            let _ = DeleteObject(white);
+            // COLORREF is 0x00BBGGRR. (background, glyph, border)
+            let (bg, fg, edge) = match with(|s| s.cfg.button_style) {
+                ButtonStyle::Light => (0x00FF_FFFF, 0x0030_2D2B, 0x00D0_CDCA),
+                ButtonStyle::Dark => (0x0031_2D2B, 0x00FF_FFFF, 0x0055_5150),
+            };
+            let n = btn_size();
+            let u = n as f32 / 36.0; // all glyph coordinates are authored on a 36 px grid
+            let p = |v: f32| (v * u).round() as i32;
+
+            let (bg_b, fg_b) = (CreateSolidBrush(COLORREF(bg)), CreateSolidBrush(COLORREF(fg)));
+            let edge_pen = CreatePen(PS_SOLID, ((u).round() as i32).max(1), COLORREF(edge));
+            let old_pen = SelectObject(dc, edge_pen);
+            let old_brush = SelectObject(dc, bg_b);
+            let _ = Ellipse(dc, 0, 0, n, n);
+
+            // Camera: body, viewfinder bump, and a lens cut out in the background colour.
+            SelectObject(dc, GetStockObject(NULL_PEN));
+            SelectObject(dc, fg_b);
+            let _ = RoundRect(dc, p(14.0), p(10.0), p(22.0), p(14.0), p(2.0), p(2.0));
+            let _ = RoundRect(dc, p(8.0), p(12.0), p(28.0), p(26.0), p(4.0), p(4.0));
+            SelectObject(dc, bg_b);
+            let _ = Ellipse(dc, p(13.5), p(15.0), p(22.5), p(24.0));
+            SelectObject(dc, fg_b);
+            let _ = Ellipse(dc, p(15.5), p(17.0), p(20.5), p(22.0));
+
+            SelectObject(dc, old_brush);
+            SelectObject(dc, old_pen);
+            let _ = DeleteObject(edge_pen);
+            let _ = DeleteObject(bg_b);
+            let _ = DeleteObject(fg_b);
             let _ = EndPaint(hwnd, &ps);
             LRESULT(0)
         }
@@ -459,8 +492,9 @@ unsafe fn button_proc_inner(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRE
 
 fn post_feedback(text: &str, ok: bool, rect: Option<RECT>) {
     *FEEDBACK.lock().unwrap_or_else(|e| e.into_inner()) = Some(Feedback { text: text.into(), ok, rect });
+    // Called from the capture thread too, so it must not touch the main thread's thread_local state.
     unsafe {
-        let core = with(|s| s.core);
+        let core = HWND(CORE_HWND.load(Ordering::Relaxed) as *mut _);
         let _ = PostMessageW(core, WM_FEEDBACK, WPARAM(0), LPARAM(0));
     }
 }
@@ -590,8 +624,16 @@ fn do_shoot(cfg: &Config) -> Result<(String, Option<RECT>), String> {
             "SnapPick_{:04}{:02}{:02}_{:02}{:02}{:02}_{:03}.png",
             t.wYear, t.wMonth, t.wDay, t.wHour, t.wMinute, t.wSecond, t.wMilliseconds
         );
-        let saved = std::fs::create_dir_all(&dir).is_ok() && img.save(dir.join(&name)).is_ok();
-        msg = if saved { "Copied and saved".into() } else { "Copied (saving to folder failed)".into() };
+        let saved = std::fs::create_dir_all(&dir)
+            .map_err(|e| e.to_string())
+            .and_then(|_| img.save(dir.join(&name)).map_err(|e| e.to_string()));
+        msg = match saved {
+            Ok(()) => format!("Copied and saved to {}", dir.display()),
+            Err(e) => {
+                log(&format!("save to {} failed: {e}", dir.display()));
+                format!("Copied, but saving to {} failed", dir.display())
+            }
+        };
     }
     Ok((msg, rect))
 }
